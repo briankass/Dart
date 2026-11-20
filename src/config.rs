@@ -42,11 +42,14 @@ impl Theme {
 pub struct Settings {
     pub hotkey: String,
     pub theme: Theme,
+    pub file_search: bool,
+    /// Extra folders to index for file search, besides the defaults.
+    pub folders: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { hotkey: DEFAULT_HOTKEY.to_string(), theme: Theme::System }
+        Self { hotkey: DEFAULT_HOTKEY.to_string(), theme: Theme::System, file_search: true, folders: Vec::new() }
     }
 }
 
@@ -66,6 +69,18 @@ impl Settings {
                         s.theme = t;
                     }
                 }
+                "file_search" => match v.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => s.file_search = true,
+                    "off" | "false" | "no" | "0" => s.file_search = false,
+                    _ => {}
+                },
+                "folders" => {
+                    s.folders = v
+                        .split(';')
+                        .map(|f| f.trim().trim_matches('"').to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -79,11 +94,17 @@ impl Settings {
              # hotkey: modifiers (Ctrl, Alt, Shift, Win) plus one key, e.g. Alt+Space,\n\
              #         Ctrl+Shift+D, Win+Alt+K, Ctrl+F12\n\
              # theme:  system, dark or light\n\
+             # file_search: on or off\n\
+             # folders: extra folders for file search, separated by ; e.g. D:\\Projects; E:\\Music\n\
              \n\
              hotkey = {}\n\
-             theme = {}\n",
+             theme = {}\n\
+             file_search = {}\n\
+             folders = {}\n",
             self.hotkey,
-            self.theme.name()
+            self.theme.name(),
+            if self.file_search { "on" } else { "off" },
+            self.folders.join("; ")
         )
     }
 }
@@ -206,7 +227,12 @@ mod tests {
 
     #[test]
     fn settings_roundtrip() {
-        let s = Settings { hotkey: "Ctrl+Shift+D".into(), theme: Theme::Light };
+        let s = Settings {
+            hotkey: "Ctrl+Shift+D".into(),
+            theme: Theme::Light,
+            file_search: false,
+            folders: vec![r"D:\Projects".into(), r"E:\My Music".into()],
+        };
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
 
@@ -214,7 +240,9 @@ mod tests {
     fn bad_values_fall_back_to_defaults() {
         let s = Settings::parse("hotkey = Banana\ntheme = purple\n# comment\njunk line");
         assert_eq!(s, Settings::default());
-        let s = Settings::parse("THEME=Dark");
+        let s = Settings::parse("THEME=Dark\nfolders = \"C:\\A\" ; ;C:\\B");
         assert_eq!(s.theme, Theme::Dark);
+        assert_eq!(s.folders, vec![r"C:\A".to_string(), r"C:\B".to_string()]);
+        assert!(s.file_search);
     }
 }

@@ -3,10 +3,11 @@
 use crate::search::{self, Entry, Searcher};
 use crate::textedit::LineEdit;
 use crate::config::{self, Settings, Theme};
+use crate::files::{self, FileEntry, FileSearcher};
 use crate::{apps, calc, index, startup, update, web};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use std::time::Duration;
@@ -33,6 +34,9 @@ const HOTKEY_ID: i32 = 1;
 const ID_EXIT: usize = 1001;
 const ID_UPDATE: usize = 1002;
 const ID_STARTUP: usize = 1003;
+const ID_FILES: usize = 1004;
+const FILE_RESCAN_AFTER: Duration = Duration::from_secs(10 * 60);
+const FILE_SLOTS: usize = 3; // rows reserved for files below apps
 const ID_HOTKEY_BASE: usize = 1100; // + preset index
 const ID_HOTKEY_CUSTOM: usize = 1199;
 const ID_THEME_SYSTEM: usize = 1200;
@@ -84,6 +88,11 @@ static INDEX: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 static HINST: OnceLock<isize> = OnceLock::new();
 static SCANNING: AtomicBool = AtomicBool::new(false);
 static LAST_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
+static FILES: Mutex<Vec<FileEntry>> = Mutex::new(Vec::new());
+static FILE_SCANNING: AtomicBool = AtomicBool::new(false);
+static LAST_FILE_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
+/// Bumped whenever file search settings change, so a stale scan is discarded.
+static FILE_GEN: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static MUTEX: Cell<Option<HANDLE>> = const { Cell::new(None) };
@@ -100,6 +109,7 @@ enum Item {
     App(Entry),
     Calc(String),
     Web(String),
+    File(Entry),
 }
 
 struct State {
@@ -108,6 +118,7 @@ struct State {
     selected: usize,
     usage: HashMap<String, u32>,
     searcher: Searcher,
+    file_searcher: FileSearcher,
     scale: f32,
     font: HFONT,
     font_small: HFONT,
@@ -200,6 +211,7 @@ pub fn run() {
                 selected: 0,
                 usage: search::load_usage(),
                 searcher: Searcher::new(),
+                file_searcher: FileSearcher::new(),
                 scale: 1.0,
                 font: make_font(20, 400),
                 font_small: make_font(13, 400),
@@ -242,6 +254,7 @@ pub fn run() {
         // Index in the background.
         let h = hwnd.0 as isize;
         start_scan(hwnd);
+        start_file_scan(hwnd);
 
         // Auto-update: shortly after start, then every 6 hours.
         std::thread::spawn(move || {
@@ -290,12 +303,49 @@ fn start_scan(hwnd: HWND) {
     });
 }
 
-/// Rescans if the last scan is old, so newly installed apps show up.
+/// Rescans if the last scan is old, so newly installed apps (and new files) show up.
 fn rescan_if_stale(hwnd: HWND) {
     let stale = LAST_SCAN.lock().unwrap().is_none_or(|t| t.elapsed() > RESCAN_AFTER);
     if stale {
         start_scan(hwnd);
     }
+    let files_stale = LAST_FILE_SCAN.lock().unwrap().is_none_or(|t| t.elapsed() > FILE_RESCAN_AFTER);
+    if files_stale {
+        start_file_scan(hwnd);
+    }
+}
+
+/// Indexes files on a background thread, if file search is on.
+fn start_file_scan(hwnd: HWND) {
+    let settings = SETTINGS.with(|c| c.borrow().clone());
+    if !settings.file_search || FILE_SCANNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut roots = files::default_roots();
+    roots.extend(settings.folders.iter().map(std::path::PathBuf::from));
+    let gen = FILE_GEN.load(Ordering::SeqCst);
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let found = files::scan(&roots);
+        if FILE_GEN.load(Ordering::SeqCst) == gen {
+            *FILES.lock().unwrap() = found;
+            *LAST_FILE_SCAN.lock().unwrap() = Some(Instant::now());
+        }
+        FILE_SCANNING.store(false, Ordering::SeqCst);
+        unsafe {
+            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_INDEXED, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// Drops the file index (file search turned off or folders changed).
+fn reset_files() {
+    FILE_GEN.fetch_add(1, Ordering::SeqCst);
+    let mut files = FILES.lock().unwrap();
+    files.clear();
+    files.shrink_to_fit();
+    drop(files);
+    *LAST_FILE_SCAN.lock().unwrap() = None;
 }
 
 unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -418,8 +468,13 @@ unsafe fn apply_settings(hwnd: HWND, mut new: Settings) {
         register_hotkey(hwnd, &old.hotkey);
         new.hotkey = old.hotkey.clone();
     }
+    let files_changed = new.file_search != old.file_search || new.folders != old.folders;
     SETTINGS.with(|c| *c.borrow_mut() = new.clone());
     config::save(&new);
+    if files_changed {
+        reset_files();
+        start_file_scan(hwnd); // no-op if file search is off
+    }
     SETTINGS_MTIME.with(|c| c.set(config::modified()));
     apply_theme();
     let _ = Shell_NotifyIconW(NIM_MODIFY, &tray_data(hwnd));
@@ -457,6 +512,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, w!("Check for updates"));
     let check = if startup::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
     let _ = AppendMenuW(menu, MF_STRING | check, ID_STARTUP, w!("Start with Windows"));
+    let fcheck = if SETTINGS.with(|c| c.borrow().file_search) { MF_CHECKED } else { MF_UNCHECKED };
+    let _ = AppendMenuW(menu, MF_STRING | fcheck, ID_FILES, w!("Search files"));
 
     let settings = SETTINGS.with(|c| c.borrow().clone());
     let hk_menu = CreatePopupMenu().unwrap();
@@ -569,16 +626,33 @@ fn window_size(_hwnd: HWND) -> (i32, i32) {
 fn refresh(s: &mut State) {
     s.results.clear();
     let query = s.edit.text();
+    let file_search = SETTINGS.with(|c| c.borrow().file_search);
+    let file_item = |f: &FileEntry| Item::File(Entry { name: f.name().to_string(), path: f.path.to_string() });
     if let Some(terms) = web::explicit(&query) {
         s.results.push(Item::Web(terms.to_string()));
+    } else if let Some(terms) = files::explicit(&query).filter(|_| file_search) {
+        let files = FILES.lock().unwrap();
+        let hits = s.file_searcher.search(&files, &s.usage, terms, MAX_RESULTS);
+        s.results.extend(hits.iter().map(|&i| file_item(&files[i])));
     } else {
         if let Some(v) = calc::eval(&query) {
             s.results.push(Item::Calc(v));
         }
-        let index = INDEX.lock().unwrap();
         let room = MAX_RESULTS - s.results.len();
-        let hits = s.searcher.search(&index, &s.usage, &query, room);
+        let file_hits: Vec<Item> = if file_search {
+            let files = FILES.lock().unwrap();
+            let hits = s.file_searcher.search(&files, &s.usage, &query, room);
+            hits.iter().map(|&i| file_item(&files[i])).collect()
+        } else {
+            Vec::new()
+        };
+        // Apps first, but keep a few rows for files when there are matches.
+        let app_room = room - file_hits.len().min(FILE_SLOTS);
+        let index = INDEX.lock().unwrap();
+        let hits = s.searcher.search(&index, &s.usage, &query, app_room);
         s.results.extend(hits.into_iter().map(|i| Item::App(index[i].clone())));
+        let left = MAX_RESULTS - s.results.len();
+        s.results.extend(file_hits.into_iter().take(left));
         if s.results.is_empty() && !query.trim().is_empty() {
             s.results.push(Item::Web(query.trim().to_string()));
         }
@@ -681,7 +755,7 @@ unsafe fn launch_selected(hwnd: HWND, mode: Mode) {
             return;
         }
         Some(Item::Web(terms)) => web::url(&terms),
-        Some(Item::App(entry)) => {
+        Some(Item::App(entry)) | Some(Item::File(entry)) => {
             let store_app = entry.path.starts_with("shell:");
             if mode == Mode::Location && store_app {
                 return; // Store apps have no file to show; keep the window open.
@@ -698,7 +772,12 @@ unsafe fn launch_selected(hwnd: HWND, mode: Mode) {
                 ShellExecuteW(None, w!("open"), w!("explorer.exe"), &HSTRING::from(args), PCWSTR::null(), SW_SHOWNORMAL);
                 return;
             }
-            if mode == Mode::Admin && !store_app {
+            let runnable = ["exe", "lnk", "bat", "cmd", "msi", "ps1"].iter().any(|ext| {
+                std::path::Path::new(&entry.path)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            });
+            if mode == Mode::Admin && !store_app && runnable {
                 hide(hwnd);
                 ShellExecuteW(None, w!("runas"), &HSTRING::from(entry.path), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
                 return;
@@ -790,6 +869,10 @@ unsafe fn paint(hwnd: HWND) {
                     let detail = if e.path.starts_with("shell:AppsFolder") { "Store app".to_string() } else { e.path.clone() };
                     (e.name.clone(), detail)
                 }
+                Item::File(e) => {
+                    let parent = std::path::Path::new(&e.path).parent().map(|p| p.display().to_string()).unwrap_or_default();
+                    (e.name.clone(), parent)
+                }
                 Item::Calc(v) => (format!("= {v}"), "Enter to copy".to_string()),
                 Item::Web(t) => (format!("Search the web for \u{201C}{t}\u{201D}"), "Google".to_string()),
             };
@@ -807,7 +890,7 @@ unsafe fn paint(hwnd: HWND) {
             let icon_x = px(PAD, sc);
             let icon_y = row_rc.top + (row_rc.bottom - row_rc.top - icon_sz) / 2;
             match &item {
-                Item::App(e) => {
+                Item::App(e) | Item::File(e) => {
                     let h = icon_for(s, &e.path);
                     if !h.is_invalid() {
                         let _ = DrawIconEx(mem, icon_x, icon_y, h, icon_sz, icon_sz, 0, None, DI_NORMAL);
@@ -1029,6 +1112,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 ID_UPDATE => manual_update_check(hwnd),
                 ID_STARTUP => startup::set(!startup::is_enabled()),
+                ID_FILES => {
+                    let mut s = SETTINGS.with(|c| c.borrow().clone());
+                    s.file_search = !s.file_search;
+                    apply_settings(hwnd, s);
+                }
                 ID_HOTKEY_CUSTOM => edit_settings_file(),
                 id @ ID_THEME_SYSTEM..=ID_THEME_LIGHT => {
                     let theme = match id {

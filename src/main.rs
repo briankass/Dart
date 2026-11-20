@@ -2,6 +2,7 @@
 
 mod calc;
 mod config;
+mod files;
 mod index;
 mod search;
 mod textedit;

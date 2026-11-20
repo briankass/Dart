@@ -6,6 +6,8 @@ A tiny, instant app launcher for Windows, written in Rust.
 - Fuzzy search over Start Menu, Desktop and Store (UWP) apps, with icons, ranked by how often you launch things.
 - Built-in calculator: type `2*21` and press Enter to copy `42`.
 - Web search: type `? something` (or `g something`). If nothing matches, Enter searches the web.
+- File search: files and folders in your user folders show up below apps. Type `f something` to
+  search files only.
 - A single small exe, no runtime. It sits in the tray using almost no CPU or RAM.
 - **Auto-updates** from GitHub Releases.
 
@@ -34,6 +36,11 @@ Right-click the tray icon for "Check for updates", "Start with Windows", "Hotkey
   menu, or choose "Custom…" to type any combination, such as `Ctrl+Shift+D` or `Win+Alt+K`. If
   another program already uses it, Dart keeps your previous hotkey and tells you.
 - **Theme:** Match Windows (switches automatically when you change the Windows theme), Dark or Light.
+- **Search files:** on by default. Dart indexes file and folder names (not contents) in Desktop,
+  Documents, Downloads, Pictures, Music, Videos and OneDrive, skipping hidden and system files,
+  `.git`, `node_modules` and `AppData`. It holds at most 100,000 items, refreshes when you open Dart
+  if the index is over 10 minutes old, and stays on your PC. Add more places with
+  `folders = D:\Projects; E:\Photos` in the settings file.
 
 Settings live in `%APPDATA%\Dart\settings.ini`. Hand edits apply the next time you open Dart or its
 tray menu.
