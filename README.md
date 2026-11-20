@@ -16,7 +16,15 @@ A tiny, instant app launcher for Windows, written in Rust.
 | Alt+Space | Show / hide |
 | Up / Down | Move selection |
 | Enter or click | Launch |
+| Ctrl+Enter | Show the file in Explorer |
+| Ctrl+Shift+Enter | Run as administrator |
+| Left / Right, Home / End | Move the cursor (Ctrl+Left/Right jumps by word) |
+| Ctrl+Backspace | Delete the previous word |
+| Ctrl+A / Ctrl+C / Ctrl+V | Select all / copy / paste the search text |
 | Esc | Hide |
+
+Newly installed apps show up automatically: Dart rescans in the background when you open it
+(at most every 30 seconds).
 
 Right-click the tray icon for "Check for updates", "Start with Windows" and "Exit".
 Launch counts are stored in `%APPDATA%\Dart\usage.txt`.

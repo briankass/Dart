@@ -3,6 +3,7 @@
 mod calc;
 mod index;
 mod search;
+mod textedit;
 mod update;
 mod web;
 #[cfg(windows)]

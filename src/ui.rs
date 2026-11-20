@@ -1,17 +1,20 @@
 //! Win32 front end: hidden window, global hotkey, tray icon, GDI painting.
 
 use crate::search::{self, Entry, Searcher};
+use crate::textedit::LineEdit;
 use crate::{apps, calc, index, startup, update, web};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use std::time::Duration;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
@@ -29,6 +32,9 @@ const HOTKEY_ID: i32 = 1;
 const ID_EXIT: usize = 1001;
 const ID_UPDATE: usize = 1002;
 const ID_STARTUP: usize = 1003;
+const TIMER_CARET: usize = 1;
+const RESCAN_AFTER: Duration = Duration::from_secs(30);
+const SELECTION: u32 = 0x00A0542B;
 const AFTER_UPDATE_ARG: &str = "--after-update";
 const MAX_RESULTS: usize = 8;
 
@@ -51,22 +57,25 @@ const GLYPH_SEARCH: char = '\u{E721}';
 
 static INDEX: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 static HINST: OnceLock<isize> = OnceLock::new();
+static SCANNING: AtomicBool = AtomicBool::new(false);
+static LAST_SCAN: Mutex<Option<Instant>> = Mutex::new(None);
 
 thread_local! {
     static MUTEX: Cell<Option<HANDLE>> = const { Cell::new(None) };
     static PENDING_RESTART: Cell<bool> = const { Cell::new(false) };
+    static CARET_ON: Cell<bool> = const { Cell::new(true) };
 }
 
 /// One row in the results list.
 #[derive(Clone)]
 enum Item {
-    App(usize),
+    App(Entry),
     Calc(String),
     Web(String),
 }
 
 struct State {
-    query: String,
+    edit: LineEdit,
     results: Vec<Item>,
     selected: usize,
     usage: HashMap<String, u32>,
@@ -158,7 +167,7 @@ pub fn run() {
 
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
-                query: String::new(),
+                edit: LineEdit::default(),
                 results: Vec::new(),
                 selected: 0,
                 usage: search::load_usage(),
@@ -200,19 +209,7 @@ pub fn run() {
 
         // Index in the background.
         let h = hwnd.0 as isize;
-        std::thread::spawn(move || {
-            let mut entries = index::scan();
-            let mut seen: std::collections::HashSet<String> =
-                entries.iter().map(|e| e.name.to_lowercase()).collect();
-            for app in apps::scan() {
-                if seen.insert(app.name.to_lowercase()) {
-                    entries.push(app);
-                }
-            }
-            entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            *INDEX.lock().unwrap() = entries;
-            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_INDEXED, WPARAM(0), LPARAM(0));
-        });
+        start_scan(hwnd);
 
         // Auto-update: shortly after start, then every 6 hours.
         std::thread::spawn(move || {
@@ -233,6 +230,39 @@ pub fn run() {
         }
 
         remove_tray_icon(hwnd);
+    }
+}
+
+/// Rescans apps on a background thread (no-op if a scan is already running).
+fn start_scan(hwnd: HWND) {
+    if SCANNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let mut entries = index::scan();
+        let mut seen: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.name.to_lowercase()).collect();
+        for app in apps::scan() {
+            if seen.insert(app.name.to_lowercase()) {
+                entries.push(app);
+            }
+        }
+        entries.sort_by_key(|e| e.name.to_lowercase());
+        *INDEX.lock().unwrap() = entries;
+        *LAST_SCAN.lock().unwrap() = Some(Instant::now());
+        SCANNING.store(false, Ordering::SeqCst);
+        unsafe {
+            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_INDEXED, WPARAM(0), LPARAM(0));
+        }
+    });
+}
+
+/// Rescans if the last scan is old, so newly installed apps show up.
+fn rescan_if_stale(hwnd: HWND) {
+    let stale = LAST_SCAN.lock().unwrap().is_none_or(|t| t.elapsed() > RESCAN_AFTER);
+    if stale {
+        start_scan(hwnd);
     }
 }
 
@@ -350,7 +380,7 @@ unsafe fn show(hwnd: HWND) {
 
     with_state(|s| {
         s.scale = scale;
-        s.query.clear();
+        s.edit.clear();
         s.selected = 0;
         refresh(s);
     });
@@ -363,11 +393,15 @@ unsafe fn show(hwnd: HWND) {
     SetWindowRgn(hwnd, Some(rgn), true);
     let _ = SetForegroundWindow(hwnd);
     let _ = SetFocus(Some(hwnd));
+    CARET_ON.with(|c| c.set(true));
+    SetTimer(Some(hwnd), TIMER_CARET, GetCaretBlinkTime().clamp(200, 1200), None);
     let _ = InvalidateRect(Some(hwnd), None, false);
+    rescan_if_stale(hwnd);
 }
 
 unsafe fn hide(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_HIDE);
+    let _ = KillTimer(Some(hwnd), TIMER_CARET);
     if PENDING_RESTART.with(|c| c.replace(false)) {
         // Let the app launch (if any) go first, then restart.
         let _ = PostMessageW(Some(hwnd), WM_UPDATED, WPARAM(0), LPARAM(0));
@@ -385,18 +419,19 @@ fn window_size(_hwnd: HWND) -> (i32, i32) {
 
 fn refresh(s: &mut State) {
     s.results.clear();
-    if let Some(terms) = web::explicit(&s.query) {
+    let query = s.edit.text();
+    if let Some(terms) = web::explicit(&query) {
         s.results.push(Item::Web(terms.to_string()));
     } else {
-        if let Some(v) = calc::eval(&s.query) {
+        if let Some(v) = calc::eval(&query) {
             s.results.push(Item::Calc(v));
         }
         let index = INDEX.lock().unwrap();
         let room = MAX_RESULTS - s.results.len();
-        let hits = s.searcher.search(&index, &s.usage, &s.query, room);
-        s.results.extend(hits.into_iter().map(Item::App));
-        if s.results.is_empty() && !s.query.trim().is_empty() {
-            s.results.push(Item::Web(s.query.trim().to_string()));
+        let hits = s.searcher.search(&index, &s.usage, &query, room);
+        s.results.extend(hits.into_iter().map(|i| Item::App(index[i].clone())));
+        if s.results.is_empty() && !query.trim().is_empty() {
+            s.results.push(Item::Web(query.trim().to_string()));
         }
     }
     if s.selected >= s.results.len() {
@@ -421,6 +456,25 @@ unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) {
         }
     }
     let _ = CloseClipboard();
+}
+
+unsafe fn read_clipboard(hwnd: HWND) -> Option<String> {
+    OpenClipboard(Some(hwnd)).ok()?;
+    let mut out = None;
+    if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
+        let g = windows::Win32::Foundation::HGLOBAL(h.0);
+        let p = GlobalLock(g) as *const u16;
+        if !p.is_null() {
+            let mut len = 0;
+            while *p.add(len) != 0 && len < 4096 {
+                len += 1;
+            }
+            out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+            let _ = GlobalUnlock(g);
+        }
+    }
+    let _ = CloseClipboard();
+    out
 }
 
 /// Loads (and caches) the shell icon for a path or shell: URL.
@@ -459,26 +513,68 @@ unsafe fn resize_to_fit(hwnd: HWND) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
-unsafe fn launch_selected(hwnd: HWND) {
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Open,
+    /// Ctrl+Enter: show the file in Explorer.
+    Location,
+    /// Ctrl+Shift+Enter: run as administrator.
+    Admin,
+}
+
+unsafe fn launch_selected(hwnd: HWND, mode: Mode) {
     let item = with_state(|s| s.results.get(s.selected).cloned()).flatten();
-    hide(hwnd);
     let target = match item {
         None => return,
         Some(Item::Calc(v)) => {
+            hide(hwnd);
             copy_to_clipboard(hwnd, &v);
             return;
         }
         Some(Item::Web(terms)) => web::url(&terms),
-        Some(Item::App(idx)) => {
-            let Some(entry) = INDEX.lock().unwrap().get(idx).cloned() else { return };
-            with_state(|s| {
-                *s.usage.entry(entry.path.clone()).or_insert(0) += 1;
-                search::save_usage(&s.usage);
-            });
+        Some(Item::App(entry)) => {
+            let store_app = entry.path.starts_with("shell:");
+            if mode == Mode::Location && store_app {
+                return; // Store apps have no file to show; keep the window open.
+            }
+            if mode != Mode::Location {
+                with_state(|s| {
+                    *s.usage.entry(entry.path.clone()).or_insert(0) += 1;
+                    search::save_usage(&s.usage);
+                });
+            }
+            if mode == Mode::Location {
+                hide(hwnd);
+                let args = format!("/select,\"{}\"", entry.path);
+                ShellExecuteW(None, w!("open"), w!("explorer.exe"), &HSTRING::from(args), PCWSTR::null(), SW_SHOWNORMAL);
+                return;
+            }
+            if mode == Mode::Admin && !store_app {
+                hide(hwnd);
+                ShellExecuteW(None, w!("runas"), &HSTRING::from(entry.path), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                return;
+            }
             entry.path
         }
     };
+    hide(hwnd);
     ShellExecuteW(None, w!("open"), &HSTRING::from(target), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+}
+
+/// Call after the query text changed.
+unsafe fn edited(hwnd: HWND) {
+    with_state(|s| {
+        s.selected = 0;
+        refresh(s);
+    });
+    CARET_ON.with(|c| c.set(true));
+    resize_to_fit(hwnd);
+}
+
+/// Call after the caret moved without changing the text.
+unsafe fn caret_moved(hwnd: HWND) {
+    CARET_ON.with(|c| c.set(true));
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 // --------------------------------------------------------------- painting
@@ -505,30 +601,42 @@ unsafe fn paint(hwnd: HWND) {
         // Input line.
         SelectObject(mem, s.font.into());
         let mut input_rc = RECT { left: px(PAD, sc), top: 0, right: cw - px(PAD, sc), bottom: px(INPUT_H, sc) };
-        let (text, color) = if s.query.is_empty() {
+        let query = s.edit.text();
+        let (text, color) = if query.is_empty() {
             ("Type to search…".to_string(), FG_DIM)
         } else {
-            (s.query.clone(), FG)
+            (query.clone(), FG)
         };
+        let text_w = |t: &str| -> i32 {
+            let w: Vec<u16> = t.encode_utf16().collect();
+            let mut sz = SIZE::default();
+            let _ = GetTextExtentPoint32W(mem, &w, &mut sz);
+            sz.cx
+        };
+        let mid = px(INPUT_H, sc) / 2;
+        let half = px(13, sc);
+        if s.edit.all_selected() {
+            let sel = RECT { left: input_rc.left, top: mid - half, right: input_rc.left + text_w(&query), bottom: mid + half };
+            let b = CreateSolidBrush(COLORREF(SELECTION));
+            FillRect(mem, &sel, b);
+            let _ = DeleteObject(b.into());
+        }
         SetTextColor(mem, COLORREF(color));
         let mut wide: Vec<u16> = text.encode_utf16().collect();
-        DrawTextW(mem, &mut wide, &mut input_rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        DrawTextW(mem, &mut wide, &mut input_rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if CARET_ON.with(|c| c.get()) && !s.edit.all_selected() {
+            let x = input_rc.left + text_w(&s.edit.before_caret());
+            let caret = RECT { left: x, top: mid - half, right: x + px(2, sc).max(1), bottom: mid + half };
+            let b = CreateSolidBrush(COLORREF(FG));
+            FillRect(mem, &caret, b);
+            let _ = DeleteObject(b.into());
+        }
 
         // Results.
-        let rows: Vec<(Item, Option<Entry>)> = {
-            let index = INDEX.lock().unwrap();
-            s.results
-                .iter()
-                .map(|it| match it {
-                    Item::App(i) => (it.clone(), index.get(*i).cloned()),
-                    _ => (it.clone(), None),
-                })
-                .collect()
-        };
-        for (row, (item, entry)) in rows.into_iter().enumerate() {
+        let rows = s.results.clone();
+        for (row, item) in rows.into_iter().enumerate() {
             let (title, detail) = match &item {
-                Item::App(_) => {
-                    let Some(e) = &entry else { continue };
+                Item::App(e) => {
                     let detail = if e.path.starts_with("shell:AppsFolder") { "Store app".to_string() } else { e.path.clone() };
                     (e.name.clone(), detail)
                 }
@@ -548,8 +656,8 @@ unsafe fn paint(hwnd: HWND) {
             let icon_sz = px(ICON_SIZE, sc);
             let icon_x = px(PAD, sc);
             let icon_y = row_rc.top + (row_rc.bottom - row_rc.top - icon_sz) / 2;
-            match (&item, &entry) {
-                (Item::App(_), Some(e)) => {
+            match &item {
+                Item::App(e) => {
                     let h = icon_for(s, &e.path);
                     if !h.is_invalid() {
                         let _ = DrawIconEx(mem, icon_x, icon_y, h, icon_sz, icon_sz, 0, None, DI_NORMAL);
@@ -626,30 +734,86 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CHAR => {
             let ch = wp.0 as u32;
-            if ch >= 0x20 && ch != 0x7F {
-                if let Some(c) = char::from_u32(ch) {
-                    with_state(|s| {
-                        s.query.push(c);
-                        s.selected = 0;
-                        refresh(s);
-                    });
-                    resize_to_fit(hwnd);
+            match ch {
+                0x01 => {
+                    // Ctrl+A
+                    with_state(|s| s.edit.select_all());
+                    caret_moved(hwnd);
                 }
-            } else if ch == 0x08 {
-                with_state(|s| {
-                    s.query.pop();
-                    s.selected = 0;
-                    refresh(s);
-                });
-                resize_to_fit(hwnd);
+                0x03 => {
+                    // Ctrl+C copies the query
+                    let q = with_state(|s| s.edit.text()).unwrap_or_default();
+                    if !q.is_empty() {
+                        copy_to_clipboard(hwnd, &q);
+                    }
+                }
+                0x16 => {
+                    // Ctrl+V
+                    if let Some(t) = read_clipboard(hwnd) {
+                        with_state(|s| s.edit.insert(&t));
+                        edited(hwnd);
+                    }
+                }
+                0x08 => {
+                    with_state(|s| s.edit.backspace());
+                    edited(hwnd);
+                }
+                0x7F => {
+                    // Ctrl+Backspace
+                    with_state(|s| s.edit.delete_word_back());
+                    edited(hwnd);
+                }
+                c if c >= 0x20 => {
+                    if let Some(c) = char::from_u32(c) {
+                        with_state(|s| s.edit.insert(&c.to_string()));
+                        edited(hwnd);
+                    }
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wp.0 == TIMER_CARET {
+                CARET_ON.with(|c| c.set(!c.get()));
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             let vk = VIRTUAL_KEY(wp.0 as u16);
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
             match vk {
                 VK_ESCAPE => hide(hwnd),
-                VK_RETURN => launch_selected(hwnd),
+                VK_RETURN => {
+                    let mode = match (ctrl, shift) {
+                        (true, true) => Mode::Admin,
+                        (true, false) => Mode::Location,
+                        _ => Mode::Open,
+                    };
+                    launch_selected(hwnd, mode);
+                }
+                VK_LEFT => {
+                    with_state(|s| if ctrl { s.edit.word_left() } else { s.edit.left() });
+                    caret_moved(hwnd);
+                }
+                VK_RIGHT => {
+                    with_state(|s| if ctrl { s.edit.word_right() } else { s.edit.right() });
+                    caret_moved(hwnd);
+                }
+                VK_HOME => {
+                    with_state(|s| s.edit.home());
+                    caret_moved(hwnd);
+                }
+                VK_END => {
+                    with_state(|s| s.edit.end());
+                    caret_moved(hwnd);
+                }
+                VK_DELETE => {
+                    with_state(|s| s.edit.delete());
+                    edited(hwnd);
+                }
                 VK_DOWN | VK_UP => {
                     with_state(|s| {
                         let n = s.results.len();
@@ -680,7 +844,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONUP => {
             if let Some(row) = row_at(lp) {
                 with_state(|s| s.selected = row);
-                launch_selected(hwnd);
+                launch_selected(hwnd, Mode::Open);
             }
             LRESULT(0)
         }
