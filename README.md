@@ -15,7 +15,7 @@ A tiny, instant app launcher for Windows, written in Rust.
 | --- | --- |
 | Alt+Space | Show / hide |
 | Up / Down | Move selection |
-| Enter | Launch |
+| Enter or click | Launch |
 | Esc | Hide |
 
 Right-click the tray icon for "Check for updates" and "Exit".

@@ -492,6 +492,20 @@ unsafe fn paint(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+/// Maps a mouse position (from a WM_MOUSE* lParam) to a result row.
+fn row_at(lp: LPARAM) -> Option<usize> {
+    let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+    with_state(|s| {
+        let top = px(INPUT_H, s.scale) + 4;
+        if y < top {
+            return None;
+        }
+        let row = ((y - top) / px(ROW_H, s.scale)) as usize;
+        (row < s.results.len()).then_some(row)
+    })
+    .flatten()
+}
+
 // --------------------------------------------------------------- messages
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -551,6 +565,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if let Some(row) = row_at(lp) {
+                let changed = with_state(|s| {
+                    let c = s.selected != row;
+                    s.selected = row;
+                    c
+                })
+                .unwrap_or(false);
+                if changed {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if let Some(row) = row_at(lp) {
+                with_state(|s| s.selected = row);
+                launch_selected(hwnd);
             }
             LRESULT(0)
         }
