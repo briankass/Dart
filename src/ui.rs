@@ -2,6 +2,7 @@
 
 use crate::search::{self, Entry, Searcher};
 use crate::textedit::LineEdit;
+use crate::config::{self, Settings, Theme};
 use crate::{apps, calc, index, startup, update, web};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -32,9 +33,13 @@ const HOTKEY_ID: i32 = 1;
 const ID_EXIT: usize = 1001;
 const ID_UPDATE: usize = 1002;
 const ID_STARTUP: usize = 1003;
+const ID_HOTKEY_BASE: usize = 1100; // + preset index
+const ID_HOTKEY_CUSTOM: usize = 1199;
+const ID_THEME_SYSTEM: usize = 1200;
+const ID_THEME_DARK: usize = 1201;
+const ID_THEME_LIGHT: usize = 1202;
 const TIMER_CARET: usize = 1;
 const RESCAN_AFTER: Duration = Duration::from_secs(30);
-const SELECTION: u32 = 0x00A0542B;
 const AFTER_UPDATE_ARG: &str = "--after-update";
 const MAX_RESULTS: usize = 8;
 
@@ -45,10 +50,30 @@ const ROW_H: i32 = 44;
 const PAD: i32 = 18;
 
 // Colors are 0x00BBGGRR.
-const BG: u32 = 0x00261F1C;
-const BG_SELECTED: u32 = 0x00453A33;
-const FG: u32 = 0x00F2EDE9;
-const FG_DIM: u32 = 0x009A8E86;
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: u32,
+    bg_selected: u32,
+    fg: u32,
+    fg_dim: u32,
+    selection: u32,
+}
+
+const DARK: Palette = Palette {
+    bg: 0x00261F1C,
+    bg_selected: 0x00453A33,
+    fg: 0x00F2EDE9,
+    fg_dim: 0x009A8E86,
+    selection: 0x00A0542B,
+};
+
+const LIGHT: Palette = Palette {
+    bg: 0x00FAFAFA,
+    bg_selected: 0x00F0E8E4,
+    fg: 0x00231F1F,
+    fg_dim: 0x007A6F6B,
+    selection: 0x00F5D2B9,
+};
 
 const ICON_SIZE: i32 = 24;
 // Segoe MDL2 Assets glyphs (built into Windows 10/11).
@@ -64,6 +89,9 @@ thread_local! {
     static MUTEX: Cell<Option<HANDLE>> = const { Cell::new(None) };
     static PENDING_RESTART: Cell<bool> = const { Cell::new(false) };
     static CARET_ON: Cell<bool> = const { Cell::new(true) };
+    static PALETTE: Cell<Palette> = const { Cell::new(DARK) };
+    static SETTINGS: RefCell<Settings> = RefCell::new(Settings::default());
+    static SETTINGS_MTIME: Cell<Option<std::time::SystemTime>> = const { Cell::new(None) };
 }
 
 /// One row in the results list.
@@ -184,22 +212,26 @@ pub fn run() {
             });
         });
 
+        SETTINGS.with(|c| *c.borrow_mut() = config::load());
+        SETTINGS_MTIME.with(|c| c.set(config::modified()));
+        apply_theme();
+
         // Retry briefly: after a self-update the old process may still hold it.
+        let hotkey = current_hotkey();
         let mut registered = false;
         for _ in 0..30 {
-            if RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_ok() {
+            if register_hotkey(hwnd, &hotkey) {
                 registered = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         if !registered {
-            MessageBoxW(
-                None,
-                w!("Could not register Alt+Space. Another program is using it."),
-                w!("Dart"),
-                MB_OK | MB_ICONWARNING,
+            let msg = format!(
+                "Could not register {hotkey}. Another program is using it.\n\n\
+                 Right-click the Dart tray icon and pick a different hotkey."
             );
+            MessageBoxW(None, &HSTRING::from(msg), w!("Dart"), MB_OK | MB_ICONWARNING);
         }
 
         add_tray_icon(hwnd);
@@ -276,7 +308,7 @@ unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
         hIcon: app_icon(GetSystemMetrics(SM_CXSMICON)),
         ..Default::default()
     };
-    let tip: Vec<u16> = format!("Dart {} (Alt+Space)", update::CURRENT).encode_utf16().collect();
+    let tip: Vec<u16> = format!("Dart {} ({})", update::CURRENT, current_hotkey()).encode_utf16().collect();
     let n = tip.len().min(127);
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     nid
@@ -316,7 +348,7 @@ unsafe fn restart(hwnd: HWND) {
     if std::process::Command::new(exe).arg(AFTER_UPDATE_ARG).spawn().is_err() {
         // Could not start the new version; keep running this one.
         add_tray_icon(hwnd);
-        let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
+        register_hotkey(hwnd, &current_hotkey());
         return;
     }
     let _ = DestroyWindow(hwnd);
@@ -330,12 +362,128 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
     let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
 }
 
+// --------------------------------------------------------------- settings
+
+fn current_hotkey() -> String {
+    SETTINGS.with(|c| c.borrow().hotkey.clone())
+}
+
+/// (Re)registers the global hotkey. Returns false if it's taken or invalid.
+unsafe fn register_hotkey(hwnd: HWND, hotkey: &str) -> bool {
+    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+    let Some((mods, vk)) = config::parse_hotkey(hotkey) else { return false };
+    RegisterHotKey(Some(hwnd), HOTKEY_ID, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok()
+}
+
+/// Reads the Windows "apps use light theme" setting.
+fn system_uses_light_theme() -> bool {
+    use windows::Win32::System::Registry::*;
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    rc == ERROR_SUCCESS && value != 0
+}
+
+fn apply_theme() {
+    let theme = SETTINGS.with(|c| c.borrow().theme);
+    let light = match theme {
+        Theme::Light => true,
+        Theme::Dark => false,
+        Theme::System => system_uses_light_theme(),
+    };
+    PALETTE.with(|c| c.set(if light { LIGHT } else { DARK }));
+}
+
+fn palette() -> Palette {
+    PALETTE.with(|c| c.get())
+}
+
+/// Applies new settings: re-registers the hotkey (keeping the old one if the
+/// new one is taken), switches theme, saves, and refreshes the tray tooltip.
+unsafe fn apply_settings(hwnd: HWND, mut new: Settings) {
+    let old = SETTINGS.with(|c| c.borrow().clone());
+    if !new.hotkey.eq_ignore_ascii_case(&old.hotkey) && !register_hotkey(hwnd, &new.hotkey) {
+        let msg = format!("{} is already used by another program. Keeping {}.", new.hotkey, old.hotkey);
+        MessageBoxW(Some(hwnd), &HSTRING::from(msg), w!("Dart"), MB_OK | MB_ICONWARNING);
+        register_hotkey(hwnd, &old.hotkey);
+        new.hotkey = old.hotkey.clone();
+    }
+    SETTINGS.with(|c| *c.borrow_mut() = new.clone());
+    config::save(&new);
+    SETTINGS_MTIME.with(|c| c.set(config::modified()));
+    apply_theme();
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &tray_data(hwnd));
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Picks up hand edits to settings.ini.
+unsafe fn reload_settings_if_changed(hwnd: HWND) {
+    let now = config::modified();
+    if now.is_some() && now != SETTINGS_MTIME.with(|c| c.get()) {
+        SETTINGS_MTIME.with(|c| c.set(now));
+        apply_settings(hwnd, config::load());
+    }
+}
+
+unsafe fn edit_settings_file() {
+    let Some(path) = config::path() else { return };
+    if !path.exists() {
+        config::save(&SETTINGS.with(|c| c.borrow().clone()));
+    }
+    ShellExecuteW(
+        None,
+        w!("open"),
+        w!("notepad.exe"),
+        &HSTRING::from(format!("\"{}\"", path.display())),
+        PCWSTR::null(),
+        SW_SHOWNORMAL,
+    );
+}
+
 unsafe fn show_tray_menu(hwnd: HWND) {
+    reload_settings_if_changed(hwnd);
     let menu = CreatePopupMenu().unwrap();
     let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(format!("Dart {}", update::CURRENT)));
     let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, w!("Check for updates"));
     let check = if startup::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
     let _ = AppendMenuW(menu, MF_STRING | check, ID_STARTUP, w!("Start with Windows"));
+
+    let settings = SETTINGS.with(|c| c.borrow().clone());
+    let hk_menu = CreatePopupMenu().unwrap();
+    let mut is_preset = false;
+    for (i, p) in config::HOTKEY_PRESETS.iter().enumerate() {
+        let on = p.eq_ignore_ascii_case(&settings.hotkey);
+        is_preset |= on;
+        let flag = if on { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(hk_menu, MF_STRING | flag, ID_HOTKEY_BASE + i, &HSTRING::from(*p));
+    }
+    if !is_preset {
+        let _ = AppendMenuW(hk_menu, MF_STRING | MF_CHECKED | MF_GRAYED, 0, &HSTRING::from(settings.hotkey.as_str()));
+    }
+    let _ = AppendMenuW(hk_menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(hk_menu, MF_STRING, ID_HOTKEY_CUSTOM, w!("Custom… (edit settings file)"));
+    let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, hk_menu.0 as usize, w!("Hotkey"));
+
+    let th_menu = CreatePopupMenu().unwrap();
+    for (id, t, label) in [
+        (ID_THEME_SYSTEM, Theme::System, w!("Match Windows")),
+        (ID_THEME_DARK, Theme::Dark, w!("Dark")),
+        (ID_THEME_LIGHT, Theme::Light, w!("Light")),
+    ] {
+        let flag = if settings.theme == t { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(th_menu, MF_STRING | flag, id, label);
+    }
+    let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, th_menu.0 as usize, w!("Theme"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
     let mut pt = POINT::default();
@@ -368,6 +516,7 @@ fn manual_update_check(hwnd: HWND) {
 // ---------------------------------------------------------------- showing
 
 unsafe fn show(hwnd: HWND) {
+    reload_settings_if_changed(hwnd);
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -593,7 +742,8 @@ unsafe fn paint(hwnd: HWND) {
 
     with_state(|s| {
         let sc = s.scale;
-        let bg = CreateSolidBrush(COLORREF(BG));
+        let pal = palette();
+        let bg = CreateSolidBrush(COLORREF(pal.bg));
         FillRect(mem, &rc, bg);
         let _ = DeleteObject(bg.into());
         SetBkMode(mem, TRANSPARENT);
@@ -603,9 +753,9 @@ unsafe fn paint(hwnd: HWND) {
         let mut input_rc = RECT { left: px(PAD, sc), top: 0, right: cw - px(PAD, sc), bottom: px(INPUT_H, sc) };
         let query = s.edit.text();
         let (text, color) = if query.is_empty() {
-            ("Type to search…".to_string(), FG_DIM)
+            ("Type to search…".to_string(), pal.fg_dim)
         } else {
-            (query.clone(), FG)
+            (query.clone(), pal.fg)
         };
         let text_w = |t: &str| -> i32 {
             let w: Vec<u16> = t.encode_utf16().collect();
@@ -617,7 +767,7 @@ unsafe fn paint(hwnd: HWND) {
         let half = px(13, sc);
         if s.edit.all_selected() {
             let sel = RECT { left: input_rc.left, top: mid - half, right: input_rc.left + text_w(&query), bottom: mid + half };
-            let b = CreateSolidBrush(COLORREF(SELECTION));
+            let b = CreateSolidBrush(COLORREF(pal.selection));
             FillRect(mem, &sel, b);
             let _ = DeleteObject(b.into());
         }
@@ -627,7 +777,7 @@ unsafe fn paint(hwnd: HWND) {
         if CARET_ON.with(|c| c.get()) && !s.edit.all_selected() {
             let x = input_rc.left + text_w(&s.edit.before_caret());
             let caret = RECT { left: x, top: mid - half, right: x + px(2, sc).max(1), bottom: mid + half };
-            let b = CreateSolidBrush(COLORREF(FG));
+            let b = CreateSolidBrush(COLORREF(pal.fg));
             FillRect(mem, &caret, b);
             let _ = DeleteObject(b.into());
         }
@@ -646,7 +796,7 @@ unsafe fn paint(hwnd: HWND) {
             let top = px(INPUT_H, sc) + 4 + row as i32 * px(ROW_H, sc);
             let row_rc = RECT { left: px(8, sc), top, right: cw - px(8, sc), bottom: top + px(ROW_H, sc) };
             if row == s.selected {
-                let b = CreateSolidBrush(COLORREF(BG_SELECTED));
+                let b = CreateSolidBrush(COLORREF(pal.bg_selected));
                 let rgn = CreateRoundRectRgn(row_rc.left, row_rc.top, row_rc.right, row_rc.bottom, px(10, sc), px(10, sc));
                 let _ = FillRgn(mem, rgn, b);
                 let _ = DeleteObject(rgn.into());
@@ -665,7 +815,7 @@ unsafe fn paint(hwnd: HWND) {
                 }
                 _ => {
                     let glyph = if matches!(item, Item::Calc(_)) { GLYPH_CALC } else { GLYPH_SEARCH };
-                    SetTextColor(mem, COLORREF(FG_DIM));
+                    SetTextColor(mem, COLORREF(pal.fg_dim));
                     SelectObject(mem, s.font_icon.into());
                     let mut g_rc = RECT { left: icon_x, top: row_rc.top, right: icon_x + icon_sz, bottom: row_rc.bottom };
                     let mut g: Vec<u16> = glyph.to_string().encode_utf16().collect();
@@ -674,13 +824,13 @@ unsafe fn paint(hwnd: HWND) {
             }
 
             let text_x = icon_x + icon_sz + px(12, sc);
-            SetTextColor(mem, COLORREF(FG));
+            SetTextColor(mem, COLORREF(pal.fg));
             SelectObject(mem, s.font.into());
             let mut name_rc = RECT { left: text_x, top: row_rc.top, right: cw / 2 + px(80, sc), bottom: row_rc.bottom };
             let mut name: Vec<u16> = title.encode_utf16().collect();
             DrawTextW(mem, &mut name, &mut name_rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-            SetTextColor(mem, COLORREF(FG_DIM));
+            SetTextColor(mem, COLORREF(pal.fg_dim));
             SelectObject(mem, s.font_small.into());
             let mut path_rc = RECT { left: cw / 2 + px(90, sc), top: row_rc.top, right: cw - px(PAD, sc), bottom: row_rc.bottom };
             let mut path: Vec<u16> = detail.encode_utf16().collect();
@@ -879,9 +1029,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 ID_UPDATE => manual_update_check(hwnd),
                 ID_STARTUP => startup::set(!startup::is_enabled()),
+                ID_HOTKEY_CUSTOM => edit_settings_file(),
+                id @ ID_THEME_SYSTEM..=ID_THEME_LIGHT => {
+                    let theme = match id {
+                        ID_THEME_DARK => Theme::Dark,
+                        ID_THEME_LIGHT => Theme::Light,
+                        _ => Theme::System,
+                    };
+                    let mut s = SETTINGS.with(|c| c.borrow().clone());
+                    s.theme = theme;
+                    apply_settings(hwnd, s);
+                }
+                id if (ID_HOTKEY_BASE..ID_HOTKEY_BASE + config::HOTKEY_PRESETS.len()).contains(&id) => {
+                    let mut s = SETTINGS.with(|c| c.borrow().clone());
+                    s.hotkey = config::HOTKEY_PRESETS[id - ID_HOTKEY_BASE].to_string();
+                    apply_settings(hwnd, s);
+                }
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // Windows switched light/dark mode.
+            let p = lp.0 as *const u16;
+            if !p.is_null() && PCWSTR(p).to_string().is_ok_and(|s| s == "ImmersiveColorSet") {
+                apply_theme();
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_DESTROY => {
             PostQuitMessage(0);

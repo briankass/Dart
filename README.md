@@ -13,7 +13,7 @@ A tiny, instant app launcher for Windows, written in Rust.
 
 | Key | Action |
 | --- | --- |
-| Alt+Space | Show / hide |
+| Alt+Space (configurable) | Show / hide |
 | Up / Down | Move selection |
 | Enter or click | Launch |
 | Ctrl+Enter | Show the file in Explorer |
@@ -26,7 +26,17 @@ A tiny, instant app launcher for Windows, written in Rust.
 Newly installed apps show up automatically: Dart rescans in the background when you open it
 (at most every 30 seconds).
 
-Right-click the tray icon for "Check for updates", "Start with Windows" and "Exit".
+Right-click the tray icon for "Check for updates", "Start with Windows", "Hotkey", "Theme" and "Exit".
+
+## Settings
+
+- **Hotkey:** pick a preset (Alt+Space, Ctrl+Space, Ctrl+Alt+Space, Alt+Shift+Space) from the tray
+  menu, or choose "Custom…" to type any combination, such as `Ctrl+Shift+D` or `Win+Alt+K`. If
+  another program already uses it, Dart keeps your previous hotkey and tells you.
+- **Theme:** Match Windows (switches automatically when you change the Windows theme), Dark or Light.
+
+Settings live in `%APPDATA%\Dart\settings.ini`. Hand edits apply the next time you open Dart or its
+tray menu.
 Launch counts are stored in `%APPDATA%\Dart\usage.txt`.
 
 ## Install
