@@ -37,11 +37,10 @@ next time Dart starts. Only `github.com` download URLs are accepted.
 
 ## Releasing
 
-1. Bump `version` in `Cargo.toml`.
-2. Commit, then `git tag v0.2.0 && git push --tags`.
-3. The `Release` workflow builds `dart.exe`, attaches it with its checksum, and publishes the release.
-
-The workflow fails if the tag and `Cargo.toml` version differ.
+Releases are automatic. Bump `version` in `Cargo.toml` and push to `main`. The `Release`
+workflow sees that the version has no release yet, then builds `dart.exe`, creates the `vX.Y.Z`
+tag, and publishes the release with its checksum. Pushes that don't change the version only run CI.
+You can also start it by hand from the Actions tab ("Run workflow").
 
 ## Building
 
