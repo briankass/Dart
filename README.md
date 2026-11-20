@@ -18,22 +18,22 @@ A tiny, instant app launcher for Windows, written in Rust.
 | Enter or click | Launch |
 | Esc | Hide |
 
-Right-click the tray icon for "Check for updates" and "Exit".
+Right-click the tray icon for "Check for updates", "Start with Windows" and "Exit".
 Launch counts are stored in `%APPDATA%\Dart\usage.txt`.
 
 ## Install
 
 Download `dart.exe` from the [latest release](https://github.com/briankass/Dart/releases/latest)
 and put it somewhere you keep programs (for example `%LOCALAPPDATA%\Dart\`). To start it at login,
-put a shortcut to it in `shell:startup`. Keep it in a folder you can write to, since the updater
-replaces the exe in place.
+tick "Start with Windows" in the tray menu (it uses the per-user Run key, so no admin rights are needed).
+Keep it in a folder you can write to, since the updater replaces the exe in place.
 
 ## Auto-update
 
 Dart checks the latest GitHub release 20 seconds after start and then every 6 hours. If the tag is
 newer than the running version it downloads `dart.exe` and `dart.exe.sha256`, verifies the SHA-256,
-renames the running exe to `dart.old`, and puts the new one in its place. The new version runs the
-next time Dart starts. Only `github.com` download URLs are accepted.
+renames the running exe to `dart.old`, puts the new one in its place, and restarts itself (waiting
+until the launcher window is closed if it's open). A tray notification confirms the new version. Only `github.com` download URLs are accepted.
 
 ## Releasing
 

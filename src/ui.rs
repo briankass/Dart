@@ -1,10 +1,10 @@
 //! Win32 front end: hidden window, global hotkey, tray icon, GDI painting.
 
 use crate::search::{self, Entry, Searcher};
-use crate::{apps, calc, index, update, web};
-use std::cell::RefCell;
+use crate::{apps, calc, index, startup, update, web};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -24,9 +24,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_INDEXED: u32 = WM_APP + 2;
+const WM_UPDATED: u32 = WM_APP + 3;
 const HOTKEY_ID: i32 = 1;
 const ID_EXIT: usize = 1001;
 const ID_UPDATE: usize = 1002;
+const ID_STARTUP: usize = 1003;
+const AFTER_UPDATE_ARG: &str = "--after-update";
 const MAX_RESULTS: usize = 8;
 
 // Layout in 96-dpi pixels.
@@ -47,6 +50,12 @@ const GLYPH_CALC: char = '\u{E8EF}';
 const GLYPH_SEARCH: char = '\u{E721}';
 
 static INDEX: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+static HINST: OnceLock<isize> = OnceLock::new();
+
+thread_local! {
+    static MUTEX: Cell<Option<HANDLE>> = const { Cell::new(None) };
+    static PENDING_RESTART: Cell<bool> = const { Cell::new(false) };
+}
 
 /// One row in the results list.
 #[derive(Clone)]
@@ -97,10 +106,25 @@ fn make_font(height: i32, weight: i32) -> HFONT {
 
 pub fn run() {
     unsafe {
-        // Single instance.
-        let _guard = CreateMutexW(None, true, w!("Local\\DartLauncherSingleton"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
+        let after_update = std::env::args().any(|a| a == AFTER_UPDATE_ARG);
+
+        // Single instance. Right after a self-update the old process may still
+        // be shutting down, so wait for it briefly.
+        let mut tries = if after_update { 50 } else { 1 };
+        loop {
+            let m = CreateMutexW(None, true, w!("Local\\DartLauncherSingleton"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                MUTEX.with(|c| c.set(m.ok()));
+                break;
+            }
+            if let Ok(h) = m {
+                let _ = CloseHandle(h);
+            }
+            tries -= 1;
+            if tries == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -109,12 +133,15 @@ pub fn run() {
 
         let hmod = GetModuleHandleW(None).unwrap();
         let hinst = HINSTANCE(hmod.0);
+        let _ = HINST.set(hinst.0 as isize);
+        startup::refresh();
         let class = w!("DartLauncherWindow");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst,
             lpszClassName: class,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -148,7 +175,16 @@ pub fn run() {
             });
         });
 
-        if RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_err() {
+        // Retry briefly: after a self-update the old process may still hold it.
+        let mut registered = false;
+        for _ in 0..30 {
+            if RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_ok() {
+                registered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !registered {
             MessageBoxW(
                 None,
                 w!("Could not register Alt+Space. Another program is using it."),
@@ -158,6 +194,9 @@ pub fn run() {
         }
 
         add_tray_icon(hwnd);
+        if after_update {
+            notify(hwnd, "Dart updated", &format!("Now running version {}.", update::CURRENT));
+        }
 
         // Index in the background.
         let h = hwnd.0 as isize;
@@ -176,10 +215,13 @@ pub fn run() {
         });
 
         // Auto-update: shortly after start, then every 6 hours.
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(20));
             loop {
-                let _ = update::check_and_apply();
+                if let Ok(update::Outcome::Updated(_)) = update::check_and_apply() {
+                    let _ = PostMessageW(Some(HWND(h as *mut _)), WM_UPDATED, WPARAM(0), LPARAM(0));
+                    return;
+                }
                 std::thread::sleep(Duration::from_secs(6 * 3600));
             }
         });
@@ -201,13 +243,53 @@ unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: 1,
         uFlags: NIF_ICON | NIF_TIP | NIF_MESSAGE,
         uCallbackMessage: WM_TRAY,
-        hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+        hIcon: app_icon(GetSystemMetrics(SM_CXSMICON)),
         ..Default::default()
     };
     let tip: Vec<u16> = format!("Dart {} (Alt+Space)", update::CURRENT).encode_utf16().collect();
     let n = tip.len().min(127);
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     nid
+}
+
+/// Loads the embedded app icon (resource ID 1) at the given size.
+unsafe fn app_icon(size: i32) -> HICON {
+    let hinst = HINST.get().map(|&h| HINSTANCE(h as *mut _));
+    match LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR) {
+        Ok(h) if !h.is_invalid() => HICON(h.0),
+        _ => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+    }
+}
+
+/// Shows a tray notification.
+unsafe fn notify(hwnd: HWND, title: &str, text: &str) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    let t: Vec<u16> = title.encode_utf16().collect();
+    let n = t.len().min(63);
+    nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+    let b: Vec<u16> = text.encode_utf16().collect();
+    let n = b.len().min(255);
+    nid.szInfo[..n].copy_from_slice(&b[..n]);
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/// Starts the freshly swapped-in exe and exits this one.
+unsafe fn restart(hwnd: HWND) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+    remove_tray_icon(hwnd);
+    if let Some(m) = MUTEX.with(|c| c.take()) {
+        let _ = CloseHandle(m);
+    }
+    if std::process::Command::new(exe).arg(AFTER_UPDATE_ARG).spawn().is_err() {
+        // Could not start the new version; keep running this one.
+        add_tray_icon(hwnd);
+        let _ = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
+        return;
+    }
+    let _ = DestroyWindow(hwnd);
 }
 
 unsafe fn add_tray_icon(hwnd: HWND) {
@@ -222,6 +304,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().unwrap();
     let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, &HSTRING::from(format!("Dart {}", update::CURRENT)));
     let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, w!("Check for updates"));
+    let check = if startup::is_enabled() { MF_CHECKED } else { MF_UNCHECKED };
+    let _ = AppendMenuW(menu, MF_STRING | check, ID_STARTUP, w!("Start with Windows"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
     let mut pt = POINT::default();
@@ -231,11 +315,18 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = DestroyMenu(menu);
 }
 
-fn manual_update_check() {
-    std::thread::spawn(|| {
+fn manual_update_check(hwnd: HWND) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || {
         let msg = match update::check_and_apply() {
             Ok(update::Outcome::UpToDate) => "Dart is up to date.".to_string(),
-            Ok(update::Outcome::Updated(v)) => format!("Updated to {v}. Restart Dart to use it."),
+            Ok(update::Outcome::Updated(_)) => {
+                // Restarts straight away; the new version shows a notification.
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(h as *mut _)), WM_UPDATED, WPARAM(0), LPARAM(0));
+                }
+                return;
+            }
             Err(e) => format!("Update check failed: {e}"),
         };
         unsafe {
@@ -277,6 +368,10 @@ unsafe fn show(hwnd: HWND) {
 
 unsafe fn hide(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_HIDE);
+    if PENDING_RESTART.with(|c| c.replace(false)) {
+        // Let the app launch (if any) go first, then restart.
+        let _ = PostMessageW(Some(hwnd), WM_UPDATED, WPARAM(0), LPARAM(0));
+    }
 }
 
 fn window_size(_hwnd: HWND) -> (i32, i32) {
@@ -589,6 +684,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             LRESULT(0)
         }
+        WM_UPDATED => {
+            if IsWindowVisible(hwnd).as_bool() {
+                PENDING_RESTART.with(|c| c.set(true)); // restart once it's hidden
+            } else {
+                restart(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_INDEXED => {
             with_state(refresh);
             if IsWindowVisible(hwnd).as_bool() {
@@ -610,7 +713,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ID_EXIT => {
                     PostQuitMessage(0);
                 }
-                ID_UPDATE => manual_update_check(),
+                ID_UPDATE => manual_update_check(hwnd),
+                ID_STARTUP => startup::set(!startup::is_enabled()),
                 _ => {}
             }
             LRESULT(0)

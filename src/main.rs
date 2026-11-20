@@ -8,6 +8,8 @@ mod web;
 #[cfg(windows)]
 mod apps;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod ui;
 
 #[cfg(windows)]
