@@ -3,7 +3,9 @@
 A tiny, instant app launcher for Windows, written in Rust.
 
 - Press **Alt+Space**, type, press **Enter**.
-- Fuzzy search over Start Menu and Desktop shortcuts, ranked by how often you launch things.
+- Fuzzy search over Start Menu, Desktop and Store (UWP) apps, with icons, ranked by how often you launch things.
+- Built-in calculator: type `2*21` and press Enter to copy `42`.
+- Web search: type `? something` (or `g something`). If nothing matches, Enter searches the web.
 - A single small exe, no runtime. It sits in the tray using almost no CPU or RAM.
 - **Auto-updates** from GitHub Releases.
 
@@ -52,7 +54,6 @@ On Windows this produces a statically linked `target\release\dart.exe`. Release 
 
 ## Roadmap
 
-- UWP / Store apps in the index
-- Configurable hotkey and theme
-- Icons next to results
-- Built-in calculator and web-search shortcuts
+- Configurable hotkey, theme and search engine
+- Rescan when apps are installed or removed
+- Code signing

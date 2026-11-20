@@ -1,7 +1,7 @@
 //! Win32 front end: hidden window, global hotkey, tray icon, GDI painting.
 
 use crate::search::{self, Entry, Searcher};
-use crate::{index, update};
+use crate::{apps, calc, index, update, web};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,7 +9,13 @@ use std::time::Duration;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -35,17 +41,32 @@ const BG_SELECTED: u32 = 0x00453A33;
 const FG: u32 = 0x00F2EDE9;
 const FG_DIM: u32 = 0x009A8E86;
 
+const ICON_SIZE: i32 = 24;
+// Segoe MDL2 Assets glyphs (built into Windows 10/11).
+const GLYPH_CALC: char = '\u{E8EF}';
+const GLYPH_SEARCH: char = '\u{E721}';
+
 static INDEX: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+/// One row in the results list.
+#[derive(Clone)]
+enum Item {
+    App(usize),
+    Calc(String),
+    Web(String),
+}
 
 struct State {
     query: String,
-    results: Vec<usize>,
+    results: Vec<Item>,
     selected: usize,
     usage: HashMap<String, u32>,
     searcher: Searcher,
     scale: f32,
     font: HFONT,
     font_small: HFONT,
+    font_icon: HFONT,
+    icons: HashMap<String, HICON>,
 }
 
 thread_local! {
@@ -83,6 +104,7 @@ pub fn run() {
         }
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // for shell icons
         update::cleanup();
 
         let hmod = GetModuleHandleW(None).unwrap();
@@ -117,6 +139,12 @@ pub fn run() {
                 scale: 1.0,
                 font: make_font(20, 400),
                 font_small: make_font(13, 400),
+                font_icon: CreateFontW(
+                    -20, 0, 0, 0, 400, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0,
+                    w!("Segoe MDL2 Assets"),
+                ),
+                icons: HashMap::new(),
             });
         });
 
@@ -134,7 +162,15 @@ pub fn run() {
         // Index in the background.
         let h = hwnd.0 as isize;
         std::thread::spawn(move || {
-            let entries = index::scan();
+            let mut entries = index::scan();
+            let mut seen: std::collections::HashSet<String> =
+                entries.iter().map(|e| e.name.to_lowercase()).collect();
+            for app in apps::scan() {
+                if seen.insert(app.name.to_lowercase()) {
+                    entries.push(app);
+                }
+            }
+            entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             *INDEX.lock().unwrap() = entries;
             let _ = PostMessageW(Some(HWND(h as *mut _)), WM_INDEXED, WPARAM(0), LPARAM(0));
         });
@@ -253,13 +289,68 @@ fn window_size(_hwnd: HWND) -> (i32, i32) {
 }
 
 fn refresh(s: &mut State) {
-    let index = INDEX.lock().unwrap();
-    s.results = s.searcher.search(&index, &s.usage, &s.query, MAX_RESULTS);
-    // Translate indices into stable ones: we hold the index lock only briefly,
-    // so store entries by index and re-read under lock when painting/launching.
+    s.results.clear();
+    if let Some(terms) = web::explicit(&s.query) {
+        s.results.push(Item::Web(terms.to_string()));
+    } else {
+        if let Some(v) = calc::eval(&s.query) {
+            s.results.push(Item::Calc(v));
+        }
+        let index = INDEX.lock().unwrap();
+        let room = MAX_RESULTS - s.results.len();
+        let hits = s.searcher.search(&index, &s.usage, &s.query, room);
+        s.results.extend(hits.into_iter().map(Item::App));
+        if s.results.is_empty() && !s.query.trim().is_empty() {
+            s.results.push(Item::Web(s.query.trim().to_string()));
+        }
+    }
     if s.selected >= s.results.len() {
         s.selected = 0;
     }
+}
+
+unsafe fn copy_to_clipboard(hwnd: HWND, text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * 2;
+    if OpenClipboard(Some(hwnd)).is_err() {
+        return;
+    }
+    let _ = EmptyClipboard();
+    if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+        let p = GlobalLock(h) as *mut u16;
+        if !p.is_null() {
+            std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+            let _ = GlobalUnlock(h);
+            // On success the clipboard owns the memory.
+            let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0)));
+        }
+    }
+    let _ = CloseClipboard();
+}
+
+/// Loads (and caches) the shell icon for a path or shell: URL.
+unsafe fn icon_for(s: &mut State, path: &str) -> HICON {
+    if let Some(&h) = s.icons.get(path) {
+        return h;
+    }
+    let mut icon = HICON::default();
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    if SHParseDisplayName(&HSTRING::from(path), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+        let mut sfi = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            PCWSTR(pidl as *const u16),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut sfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_PIDL | SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if ok != 0 {
+            icon = sfi.hIcon;
+        }
+        ILFree(Some(pidl));
+    }
+    s.icons.insert(path.to_string(), icon); // cache failures too
+    icon
 }
 
 unsafe fn resize_to_fit(hwnd: HWND) {
@@ -274,18 +365,25 @@ unsafe fn resize_to_fit(hwnd: HWND) {
 }
 
 unsafe fn launch_selected(hwnd: HWND) {
-    let target = with_state(|s| {
-        let idx = *s.results.get(s.selected)?;
-        let entry = INDEX.lock().unwrap().get(idx)?.clone();
-        *s.usage.entry(entry.path.clone()).or_insert(0) += 1;
-        search::save_usage(&s.usage);
-        Some(entry.path)
-    })
-    .flatten();
+    let item = with_state(|s| s.results.get(s.selected).cloned()).flatten();
     hide(hwnd);
-    if let Some(path) = target {
-        ShellExecuteW(None, w!("open"), &HSTRING::from(path), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    let target = match item {
+        None => return,
+        Some(Item::Calc(v)) => {
+            copy_to_clipboard(hwnd, &v);
+            return;
+        }
+        Some(Item::Web(terms)) => web::url(&terms),
+        Some(Item::App(idx)) => {
+            let Some(entry) = INDEX.lock().unwrap().get(idx).cloned() else { return };
+            with_state(|s| {
+                *s.usage.entry(entry.path.clone()).or_insert(0) += 1;
+                search::save_usage(&s.usage);
+            });
+            entry.path
+        }
+    };
+    ShellExecuteW(None, w!("open"), &HSTRING::from(target), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
 }
 
 // --------------------------------------------------------------- painting
@@ -322,9 +420,26 @@ unsafe fn paint(hwnd: HWND) {
         DrawTextW(mem, &mut wide, &mut input_rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
         // Results.
-        let index = INDEX.lock().unwrap();
-        for (row, &idx) in s.results.iter().enumerate() {
-            let Some(entry) = index.get(idx) else { continue };
+        let rows: Vec<(Item, Option<Entry>)> = {
+            let index = INDEX.lock().unwrap();
+            s.results
+                .iter()
+                .map(|it| match it {
+                    Item::App(i) => (it.clone(), index.get(*i).cloned()),
+                    _ => (it.clone(), None),
+                })
+                .collect()
+        };
+        for (row, (item, entry)) in rows.into_iter().enumerate() {
+            let (title, detail) = match &item {
+                Item::App(_) => {
+                    let Some(e) = &entry else { continue };
+                    let detail = if e.path.starts_with("shell:AppsFolder") { "Store app".to_string() } else { e.path.clone() };
+                    (e.name.clone(), detail)
+                }
+                Item::Calc(v) => (format!("= {v}"), "Enter to copy".to_string()),
+                Item::Web(t) => (format!("Search the web for \u{201C}{t}\u{201D}"), "Google".to_string()),
+            };
             let top = px(INPUT_H, sc) + 4 + row as i32 * px(ROW_H, sc);
             let row_rc = RECT { left: px(8, sc), top, right: cw - px(8, sc), bottom: top + px(ROW_H, sc) };
             if row == s.selected {
@@ -334,16 +449,38 @@ unsafe fn paint(hwnd: HWND) {
                 let _ = DeleteObject(rgn.into());
                 let _ = DeleteObject(b.into());
             }
+            // Icon column.
+            let icon_sz = px(ICON_SIZE, sc);
+            let icon_x = px(PAD, sc);
+            let icon_y = row_rc.top + (row_rc.bottom - row_rc.top - icon_sz) / 2;
+            match (&item, &entry) {
+                (Item::App(_), Some(e)) => {
+                    let h = icon_for(s, &e.path);
+                    if !h.is_invalid() {
+                        let _ = DrawIconEx(mem, icon_x, icon_y, h, icon_sz, icon_sz, 0, None, DI_NORMAL);
+                    }
+                }
+                _ => {
+                    let glyph = if matches!(item, Item::Calc(_)) { GLYPH_CALC } else { GLYPH_SEARCH };
+                    SetTextColor(mem, COLORREF(FG_DIM));
+                    SelectObject(mem, s.font_icon.into());
+                    let mut g_rc = RECT { left: icon_x, top: row_rc.top, right: icon_x + icon_sz, bottom: row_rc.bottom };
+                    let mut g: Vec<u16> = glyph.to_string().encode_utf16().collect();
+                    DrawTextW(mem, &mut g, &mut g_rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+                }
+            }
+
+            let text_x = icon_x + icon_sz + px(12, sc);
             SetTextColor(mem, COLORREF(FG));
             SelectObject(mem, s.font.into());
-            let mut name_rc = RECT { left: px(PAD, sc), top: row_rc.top, right: cw / 2 + px(60, sc), bottom: row_rc.bottom };
-            let mut name: Vec<u16> = entry.name.encode_utf16().collect();
+            let mut name_rc = RECT { left: text_x, top: row_rc.top, right: cw / 2 + px(80, sc), bottom: row_rc.bottom };
+            let mut name: Vec<u16> = title.encode_utf16().collect();
             DrawTextW(mem, &mut name, &mut name_rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
             SetTextColor(mem, COLORREF(FG_DIM));
             SelectObject(mem, s.font_small.into());
-            let mut path_rc = RECT { left: cw / 2 + px(70, sc), top: row_rc.top, right: cw - px(PAD, sc), bottom: row_rc.bottom };
-            let mut path: Vec<u16> = entry.path.encode_utf16().collect();
+            let mut path_rc = RECT { left: cw / 2 + px(90, sc), top: row_rc.top, right: cw - px(PAD, sc), bottom: row_rc.bottom };
+            let mut path: Vec<u16> = detail.encode_utf16().collect();
             DrawTextW(mem, &mut path, &mut path_rc, DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS | DT_NOPREFIX | DT_RIGHT);
         }
     });
@@ -419,6 +556,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_INDEXED => {
             with_state(refresh);
+            if IsWindowVisible(hwnd).as_bool() {
+                resize_to_fit(hwnd);
+            }
             LRESULT(0)
         }
         WM_TRAY => {
