@@ -1,0 +1,49 @@
+name: Release
+
+# Push a tag like v0.2.0 to publish a release. Running copies of Dart
+# pick it up automatically via their built-in updater.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag $tag does not match Cargo.toml version $ver"; exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cp target/release/dart.exe dart.exe
+          sha256sum dart.exe | cut -d' ' -f1 > dart.exe.sha256
+          ls -l dart.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dart.exe
+            dart.exe.sha256
+          generate_release_notes: true
